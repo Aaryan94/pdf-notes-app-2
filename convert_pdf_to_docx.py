@@ -94,7 +94,7 @@ def add_bullet(doc: Document, text: str, level: int = 0) -> None:
         r.font.size = Pt(12)
 
 
-# ✅ UPDATE ONLY: add skip_noise flag so we can stop skipping lines in no_bullets mode
+# UPDATED: allow disabling noise-skipping in no_bullets mode
 def normalize_lines(text: str, skip_noise: bool = True):
     lines = []
     for ln in text.splitlines():
@@ -364,7 +364,6 @@ def postprocess_formatting(docx_path: str) -> None:
     doc.save(docx_path)
 
 
-# ✅ UPDATE ONLY: add no_bullets flag so app.py can pass it, and use it to control skipping
 def convert(pdf_path: str, out_docx_path: str, no_bullets: bool = False) -> None:
     pdf = fitz.open(pdf_path)
     doc = Document()
@@ -376,9 +375,8 @@ def convert(pdf_path: str, out_docx_path: str, no_bullets: bool = False) -> None
         # IMPORTANT: keep your existing text extraction so output content stays identical
         raw = page.get_text("text") or ""
 
-        # ✅ UPDATE ONLY: if no_bullets=True, do NOT skip "footer noise" lines
+        # If no_bullets=True, do NOT skip "footer noise" lines
         lines = normalize_lines(raw, skip_noise=not no_bullets)
-
         if not lines:
             continue
 
@@ -442,6 +440,10 @@ def convert(pdf_path: str, out_docx_path: str, no_bullets: bool = False) -> None
             # continuation line: append to existing bullet
             if current_bullet:
                 current_bullet += " " + ln
+            elif no_bullets:
+                # Handout mode: treat plain lines as bullet items so content isn't lost
+                current_bullet = ln
+                current_level = 0
 
         flush_bullet()
         doc.add_paragraph("")
