@@ -278,7 +278,7 @@ def _levels_for_bullets_on_page(bullet_xs: list[float]) -> list[int]:
 
 
 # ----------------------------
-# POSTPROCESSING ONLY (bullet mode)
+# POSTPROCESSING ONLY
 # ----------------------------
 def postprocess_formatting(docx_path: str) -> None:
     doc = Document(docx_path)
@@ -412,7 +412,7 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
 
         # Slide title:
         # - bullets_only: original heuristic behaviour (unchanged)
-        # - all_lines: ONLY CHANGE REQUESTED -> title is first line by (y,x) coordinates
+        # - all_lines: title is first line by (y,x) coordinates
         if mode == "all_lines":
             title = _extract_first_line_text(page)
         else:
@@ -482,9 +482,9 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
 
     doc.save(out_docx_path)
 
-    # IMPORTANT: do NOT run postprocessing in all-lines mode
-    if mode == "bullets_only":
-        postprocess_formatting(out_docx_path)
+    # ONLY CHANGE REQUESTED:
+    # Run postprocessing for all_lines mode as well (i.e., always run it).
+    postprocess_formatting(out_docx_path)
 
     print(f"Saved (formatted): {out_docx_path}")
 
