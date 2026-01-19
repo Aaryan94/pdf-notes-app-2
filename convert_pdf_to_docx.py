@@ -477,6 +477,11 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
 
                 bt = bullet_text(txt)
                 text_out = bt if bt is not None else txt
+
+                # NEW FEATURE (all_lines only): ignore single-character lines
+                if len(text_out.strip()) == 1:
+                    continue
+
                 add_bullet(doc, text_out, lvl)
 
             flush_bullet()
