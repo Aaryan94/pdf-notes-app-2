@@ -56,6 +56,10 @@ if run:
                     )
                 convert(pdf_path, intermediate_docx)
 
+            # Read intermediate bytes BEFORE temp dir is deleted
+            with open(intermediate_docx, "rb") as f:
+                intermediate_bytes = f.read()
+
             # Script 2
             apply_template_bullets(intermediate_docx, TEMPLATE_PATH, final_docx)
 
@@ -64,8 +68,16 @@ if run:
                 final_bytes = f.read()
 
     st.success("Done.")
+
     st.download_button(
-        "Download DOCX",
+        "Download INTERMEDIATE DOCX",
+        data=intermediate_bytes,
+        file_name="notes_intermediate.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    st.download_button(
+        "Download FINAL DOCX",
         data=final_bytes,
         file_name="notes.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
