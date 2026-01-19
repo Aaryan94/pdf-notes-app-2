@@ -114,7 +114,7 @@ def bullet_text(line: str):
 
 
 # ----------------------------
-# COORDINATE-BASED BULLET LEVELS
+# COORDINATE-BASED LEVELS
 # ----------------------------
 def _is_bullet_start_text(t: str) -> bool:
     if not t:
@@ -187,6 +187,43 @@ def _extract_bullet_x_positions(page: fitz.Page) -> list[float]:
     return [bx for _, __, bx in hits]
 
 
+def _extract_line_x_positions(page: fitz.Page) -> list[float]:
+    """
+    Returns a list of x-positions (line left edge) for ALL text lines on the page,
+    in reading order (top-to-bottom, left-to-right).
+    """
+    d = page.get_text("dict")
+    hits = []
+
+    for block in d.get("blocks", []):
+        if block.get("type") != 0:  # text block
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+
+            # Skip lines that are only whitespace
+            line_text = "".join(s.get("text", "") for s in spans)
+            if not line_text or not line_text.strip():
+                continue
+
+            # Use the left-most x0 among spans as the line x
+            xs = [float(s["bbox"][0]) for s in spans if s.get("text", "").strip()]
+            if not xs:
+                continue
+            line_x = min(xs)
+
+            bbox = line.get("bbox") or spans[0].get("bbox")
+            y0 = float(bbox[1]) if bbox else 0.0
+            x0 = float(bbox[0]) if bbox else line_x
+
+            hits.append((y0, x0, line_x))
+
+    hits.sort(key=lambda t: (t[0], t[1]))
+    return [lx for _, __, lx in hits]
+
+
 def _cluster_x_positions(xs: list[float], tol: float = 4.0) -> list[float]:
     """
     Cluster x positions into columns using a simple tolerance (points).
@@ -210,13 +247,12 @@ def _cluster_x_positions(xs: list[float], tol: float = 4.0) -> list[float]:
 
 def _levels_for_bullets_on_page(bullet_xs: list[float]) -> list[int]:
     """
-    Convert bullet x positions to levels 0/1/2 by clustering.
+    Convert x positions to levels 0/1/2 by clustering.
     Leftmost cluster => level 0, next => level 1, etc.
     """
     if not bullet_xs:
         return []
     centers = _cluster_x_positions(bullet_xs, tol=4.0)
-    # Map each bullet x to the nearest cluster center index
     levels = []
     for x in bullet_xs:
         idx = min(range(len(centers)), key=lambda i: abs(x - centers[i]))
@@ -225,9 +261,7 @@ def _levels_for_bullets_on_page(bullet_xs: list[float]) -> list[int]:
 
 
 # ----------------------------
-# POSTPROCESSING ONLY: make bullets look like Word default (filled dot at all levels)
-# and make headings bulleted + indent their children appropriately.
-# (NO content changes.)
+# POSTPROCESSING ONLY (bullet mode)
 # ----------------------------
 def postprocess_formatting(docx_path: str) -> None:
     """
@@ -237,7 +271,6 @@ def postprocess_formatting(docx_path: str) -> None:
     3) Force ALL bullets to use "List Bullet" (filled dot) and simulate nesting via indentation only.
        Bullets under a heading are shifted +1 level deeper (cap at 2).
     """
-
     doc = Document(docx_path)
     paras = doc.paragraphs
 
@@ -245,10 +278,8 @@ def postprocess_formatting(docx_path: str) -> None:
         txt = (p.text or "").strip()
         if not txt:
             return False
-        # don't treat list paragraphs as headings
         if p.style and p.style.name and p.style.name.startswith("List"):
             return False
-        # Heading = all non-empty runs are bold
         any_nonempty_run = False
         for run in p.runs:
             if run.text and run.text.strip():
@@ -261,8 +292,6 @@ def postprocess_formatting(docx_path: str) -> None:
         return bool(p.style and p.style.name and p.style.name.startswith("List"))
 
     def bullet_level_from_style_name(name: str) -> int:
-        # Infer level from what the converter produced:
-        # "List Bullet" => 0, "List Bullet 2" => 1, "List Bullet 3" => 2
         if name == "List Bullet":
             return 0
         if name == "List Bullet 2":
@@ -271,11 +300,9 @@ def postprocess_formatting(docx_path: str) -> None:
             return 2
         return 0
 
-    # Indentation parameters (points). Adjust if you want slightly different spacing,
-    # but this keeps a clean Word-like nested bullet appearance.
-    HANG = Pt(18)       # hanging indent so wrapped lines align after bullet glyph
-    STEP = Pt(18)       # indent step per level
-    BASE_LEFT = Pt(18)  # level 0 left indent
+    HANG = Pt(18)
+    STEP = Pt(18)
+    BASE_LEFT = Pt(18)
 
     def apply_level_indent(p, level: int) -> None:
         level = max(0, min(level, 2))
@@ -288,7 +315,6 @@ def postprocess_formatting(docx_path: str) -> None:
             r.font.name = "Aptos (Body)"
             r.font.size = Pt(12)
 
-    # ---- (1) Remove headings that have no bullets beneath them (same as your original cleanup) ----
     to_delete_idxs = []
     for i, p in enumerate(paras):
         if not is_heading(p):
@@ -310,29 +336,21 @@ def postprocess_formatting(docx_path: str) -> None:
         p = paras[i]
         p._element.getparent().remove(p._element)
 
-    # Refresh after deletions
     paras = doc.paragraphs
-
-    # ---- (2)(3) Headings => List Bullet; bullets => List Bullet always, indent for nesting ----
     in_heading_block = False
 
     for p in paras:
         if is_heading(p):
-            # Heading becomes a filled-dot bullet at level 0
             p.style = doc.styles["List Bullet"]
             apply_level_indent(p, 0)
-
-            # Keep heading bold (already bold, but enforce)
             for r in p.runs:
                 if r.text and r.text.strip():
                     r.bold = True
             enforce_aptos_12(p)
-
             in_heading_block = True
             continue
 
         if in_heading_block and is_bullet(p):
-            # Shift bullets under heading +1 level, but keep filled-dot bullet glyph
             old_name = p.style.name if p.style else ""
             old_level = bullet_level_from_style_name(old_name)
             new_level = min(old_level + 1, 2)
@@ -342,14 +360,12 @@ def postprocess_formatting(docx_path: str) -> None:
             enforce_aptos_12(p)
             continue
 
-        # End heading block when we hit blank or non-bullet content
         if (p.text or "").strip() == "":
             in_heading_block = False
         else:
             if not is_bullet(p):
                 in_heading_block = False
 
-        # For bullets not under headings, still force filled-dot look and preserve their level
         if is_bullet(p):
             old_name = p.style.name if p.style else ""
             lvl = bullet_level_from_style_name(old_name)
@@ -371,16 +387,19 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
     for page_index in range(pdf.page_count):
         page = pdf.load_page(page_index)
 
-        # IMPORTANT: keep your existing text extraction so output content stays identical
         raw = page.get_text("text") or ""
         lines = normalize_lines(raw)
         if not lines:
             continue
 
-        # Compute bullet levels using coordinates (does not affect 'lines')
+        # Coordinate-derived levels
         bullet_xs = _extract_bullet_x_positions(page)
         bullet_levels = _levels_for_bullets_on_page(bullet_xs)
         bullet_level_idx = 0
+
+        line_xs = _extract_line_x_positions(page)
+        line_levels = _levels_for_bullets_on_page(line_xs)
+        line_level_idx = 0
 
         # Slide title: first non-bullet line (or short fallback)
         title = None
@@ -415,11 +434,23 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
             bt = bullet_text(ln)
             is_head = looks_like_heading(ln)
 
+            if mode == "all_lines":
+                # ONLY change requested: in all-lines mode, every line is written to the docx.
+                if is_head:
+                    flush_bullet()
+                    add_bold_line(doc, ln)
+                else:
+                    flush_bullet()
+                    lvl = line_levels[line_level_idx] if line_level_idx < len(line_levels) else 0
+                    line_level_idx += 1
+                    text_out = bt if bt is not None else ln
+                    add_bullet(doc, text_out, lvl)
+                continue
+
+            # ---- bullets_only (original behaviour) ----
             if bt is not None:
-                # new bullet starts
                 flush_bullet()
 
-                # Pull the next coordinate-derived level if available; else default to 0
                 if bullet_level_idx < len(bullet_levels):
                     current_level = bullet_levels[bullet_level_idx]
                     bullet_level_idx += 1
@@ -434,14 +465,12 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
                 add_bold_line(doc, ln)
                 continue
 
-            # continuation line: append to existing bullet
             if current_bullet:
                 current_bullet += " " + ln
 
         flush_bullet()
         doc.add_paragraph("")
 
-    # Save then postprocess formatting (ONLY formatting changes)
     doc.save(out_docx_path)
 
     # IMPORTANT: do NOT run postprocessing in all-lines mode
