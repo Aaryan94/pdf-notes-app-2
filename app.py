@@ -130,8 +130,8 @@ if pdf_file is not None and recommended_mode == "all_lines":
 mode_label = st.radio(
     "Conversion mode",
     options=[
-        "Bullets only (original)",
-        "All lines as bullets (indent-based)",
+        "Bullets only (original) --> e.g. CS241",
+        "All lines as bullets --> e.g. CS262",
     ],
     index=default_index,
     disabled=(pdf_file is None),
