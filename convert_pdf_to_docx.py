@@ -133,7 +133,6 @@ def _extract_bullet_x_positions(page: fitz.Page) -> list[float]:
     d = page.get_text("dict")
     hits = []
 
-    # Walk blocks/lines/spans; sort lines by y then x for stable reading order.
     for block in d.get("blocks", []):
         if block.get("type") != 0:  # 0 = text block
             continue
@@ -142,36 +141,28 @@ def _extract_bullet_x_positions(page: fitz.Page) -> list[float]:
             if not spans:
                 continue
 
-            # Build the line text in a conservative way
             line_text = "".join(s.get("text", "") for s in spans)
             if not _is_bullet_start_text(line_text):
                 continue
 
-            # Find the span where the first non-space char lives; use its x0
             bullet_x = None
             for s in spans:
                 st = s.get("text", "")
                 if not st:
                     continue
-                # Skip spans that are only whitespace
                 if not st.strip():
                     continue
 
-                # The bullet glyph is the first non-space char of the full line
-                # If this span begins (after lstrip) with a bullet, take its x0.
                 if st.lstrip() and st.lstrip()[0] in BULLET_CHARS:
                     bullet_x = float(s["bbox"][0])
                     break
 
-                # Otherwise, sometimes the bullet is glued after spaces in the same span
-                # We still treat the first non-space char as the bullet. If it is bullet, use this span x0.
                 first = st.lstrip()[0] if st.lstrip() else ""
                 if first in BULLET_CHARS:
                     bullet_x = float(s["bbox"][0])
                     break
 
             if bullet_x is None:
-                # Fallback: use line bbox x0 if span parsing fails
                 bbox = line.get("bbox")
                 if bbox:
                     bullet_x = float(bbox[0])
@@ -203,12 +194,10 @@ def _extract_line_x_positions(page: fitz.Page) -> list[float]:
             if not spans:
                 continue
 
-            # Skip lines that are only whitespace
             line_text = "".join(s.get("text", "") for s in spans)
             if not line_text or not line_text.strip():
                 continue
 
-            # Use the left-most x0 among spans as the line x
             xs = [float(s["bbox"][0]) for s in spans if s.get("text", "").strip()]
             if not xs:
                 continue
@@ -224,12 +213,44 @@ def _extract_line_x_positions(page: fitz.Page) -> list[float]:
     return [lx for _, __, lx in hits]
 
 
+def _extract_first_line_text(page: fitz.Page) -> str | None:
+    """
+    ONLY USED FOR all_lines MODE:
+    Determine the slide title as the first text line on the page by (y, x) order,
+    using coordinates (not looks_like_heading), and return its normalized text.
+    """
+    d = page.get_text("dict")
+    hits: list[tuple[float, float, str]] = []
+
+    for block in d.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+
+            text = "".join(s.get("text", "") for s in spans)
+            text = re.sub(r"\s+", " ", text.strip())
+            if not text or is_footer_noise(text):
+                continue
+
+            bbox = line.get("bbox") or spans[0].get("bbox")
+            if not bbox:
+                continue
+
+            y0 = float(bbox[1])
+            x0 = float(bbox[0])
+            hits.append((y0, x0, text))
+
+    if not hits:
+        return None
+
+    hits.sort(key=lambda t: (t[0], t[1]))
+    return hits[0][2]
+
+
 def _cluster_x_positions(xs: list[float], tol: float = 4.0) -> list[float]:
-    """
-    Cluster x positions into columns using a simple tolerance (points).
-    Returns cluster centers sorted ascending.
-    Deterministic and robust for slide bullets.
-    """
     if not xs:
         return []
     xs_sorted = sorted(xs)
@@ -246,10 +267,6 @@ def _cluster_x_positions(xs: list[float], tol: float = 4.0) -> list[float]:
 
 
 def _levels_for_bullets_on_page(bullet_xs: list[float]) -> list[int]:
-    """
-    Convert x positions to levels 0/1/2 by clustering.
-    Leftmost cluster => level 0, next => level 1, etc.
-    """
     if not bullet_xs:
         return []
     centers = _cluster_x_positions(bullet_xs, tol=4.0)
@@ -264,13 +281,6 @@ def _levels_for_bullets_on_page(bullet_xs: list[float]) -> list[int]:
 # POSTPROCESSING ONLY (bullet mode)
 # ----------------------------
 def postprocess_formatting(docx_path: str) -> None:
-    """
-    Postprocess the produced DOCX WITHOUT changing content:
-    1) Remove bold-only heading paragraphs that have no bullet paragraphs beneath them (before next heading).
-    2) Convert remaining headings into level-0 bullets ("List Bullet"), keeping the heading text bold.
-    3) Force ALL bullets to use "List Bullet" (filled dot) and simulate nesting via indentation only.
-       Bullets under a heading are shifted +1 level deeper (cap at 2).
-    """
     doc = Document(docx_path)
     paras = doc.paragraphs
 
@@ -392,7 +402,6 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
         if not lines:
             continue
 
-        # Coordinate-derived levels
         bullet_xs = _extract_bullet_x_positions(page)
         bullet_levels = _levels_for_bullets_on_page(bullet_xs)
         bullet_level_idx = 0
@@ -401,16 +410,20 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
         line_levels = _levels_for_bullets_on_page(line_xs)
         line_level_idx = 0
 
-        # Slide title: first non-bullet line (or short fallback)
-        title = None
-        for ln in lines:
-            if bullet_text(ln) is not None:
-                continue
-            if looks_like_heading(ln) or len(ln) <= 60:
-                title = ln
-                break
+        # Slide title:
+        # - bullets_only: original heuristic behaviour (unchanged)
+        # - all_lines: ONLY CHANGE REQUESTED -> title is first line by (y,x) coordinates
+        if mode == "all_lines":
+            title = _extract_first_line_text(page)
+        else:
+            title = None
+            for ln in lines:
+                if bullet_text(ln) is not None:
+                    continue
+                if looks_like_heading(ln) or len(ln) <= 60:
+                    title = ln
+                    break
 
-        # Skip slides titled Outline or Summary (case-insensitive)
         if title and title.strip().lower() in {"outline", "summary"}:
             continue
 
@@ -435,16 +448,12 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
             is_head = looks_like_heading(ln)
 
             if mode == "all_lines":
-                # ONLY change requested: in all-lines mode, every line is written to the docx.
-                if is_head:
-                    flush_bullet()
-                    add_bold_line(doc, ln)
-                else:
-                    flush_bullet()
-                    lvl = line_levels[line_level_idx] if line_level_idx < len(line_levels) else 0
-                    line_level_idx += 1
-                    text_out = bt if bt is not None else ln
-                    add_bullet(doc, text_out, lvl)
+                # headings in all_lines mode are ONLY the first thing on the slide (already added above)
+                flush_bullet()
+                lvl = line_levels[line_level_idx] if line_level_idx < len(line_levels) else 0
+                line_level_idx += 1
+                text_out = bt if bt is not None else ln
+                add_bullet(doc, text_out, lvl)
                 continue
 
             # ---- bullets_only (original behaviour) ----
