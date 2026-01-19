@@ -1,5 +1,6 @@
 import os
 import tempfile
+import inspect
 import streamlit as st
 
 from convert_pdf_to_docx import convert
@@ -11,19 +12,28 @@ st.set_page_config(page_title="PDF → Notes", layout="centered")
 st.title("PDF → Notes Generator")
 st.write("Upload a PDF and download the formatted Word notes.")
 
-# Some PDFs (especially handouts) have meaningful lines but no bullet glyphs.
-# When enabled, we treat every non-heading line as if it were a bullet line.
-all_bullets_mode = st.checkbox(
-    "Treat every line as a bullet (for PDFs without bullet points)",
-    value=False,
+pdf_file = st.file_uploader("Upload your PDF", type=["pdf"])
+
+mode = st.radio(
+    "PDF type",
+    options=[
+        "Slide deck (has bullets)",
+        "Handout / no bullets (layout-based)",
+    ],
+    index=0,
+    help=(
+        "Choose 'Handout / no bullets' for PDFs that are mostly continuous text with headings, "
+        "tables, or paragraphs (few/no bullet glyphs)."
+    ),
 )
 
-pdf_file = st.file_uploader("Upload your PDF", type=["pdf"])
+no_bullets = mode.startswith("Handout")
+
 run = st.button("Run", type="primary", disabled=(pdf_file is None))
 
 if run:
     if not os.path.exists(TEMPLATE_PATH):
-        st.error("Server misconfigured: Doc2.docx not found.")
+        st.error("Server misconfigured: Doc2.docx not found next to app.py.")
         st.stop()
 
     with st.spinner("Converting PDF → DOCX..."):
@@ -36,18 +46,41 @@ if run:
             with open(pdf_path, "wb") as f:
                 f.write(pdf_file.getbuffer())
 
-            # Script 1
-            convert(pdf_path, intermediate_docx, force_all_lines_bullets=all_bullets_mode)
+            # ---- Script 1 (convert) ----
+            # Backwards-compatible: only pass the flag if convert() supports it.
+            try:
+                sig = inspect.signature(convert)
+                params = sig.parameters
 
-            # Script 2
-            apply_template_bullets(intermediate_docx, TEMPLATE_PATH, final_docx)
+                if "no_bullets" in params:
+                    convert(pdf_path, intermediate_docx, no_bullets=no_bullets)
+                elif "mode" in params:
+                    convert(pdf_path, intermediate_docx, mode=("handout" if no_bullets else "bullets"))
+                else:
+                    # convert() doesn't accept a mode flag yet
+                    if no_bullets:
+                        st.warning(
+                            "You selected 'Handout / no bullets', but convert() does not yet support a mode flag. "
+                            "It will run in bullet mode for now."
+                        )
+                    convert(pdf_path, intermediate_docx)
 
-            st.success("Done.")
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
+                st.stop()
 
-            with open(final_docx, "rb") as f:
-                st.download_button(
-                    "Download DOCX",
-                    f,
-                    file_name="notes.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
+            # ---- Script 2 (template bullets) ----
+            try:
+                apply_template_bullets(intermediate_docx, TEMPLATE_PATH, final_docx)
+            except Exception as e:
+                st.error(f"Template formatting failed: {e}")
+                st.stop()
+
+    st.success("Done.")
+    with open(final_docx, "rb") as f:
+        st.download_button(
+            "Download DOCX",
+            f,
+            file_name="notes.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
