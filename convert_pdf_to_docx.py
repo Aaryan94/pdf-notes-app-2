@@ -363,7 +363,14 @@ def postprocess_formatting(docx_path: str) -> None:
     doc.save(docx_path)
 
 
-def convert(pdf_path: str, out_docx_path: str) -> None:
+def convert(pdf_path: str, out_docx_path: str, force_all_lines_bullets: bool = False) -> None:
+    """
+    Original behaviour is unchanged when force_all_lines_bullets=False (default).
+
+    New feature:
+      - If force_all_lines_bullets=True, any non-heading line that is not explicitly a bullet
+        is treated as its own bullet line at level 0.
+    """
     pdf = fitz.open(pdf_path)
     doc = Document()
     set_aptos_12(doc)
@@ -416,7 +423,7 @@ def convert(pdf_path: str, out_docx_path: str) -> None:
             is_head = looks_like_heading(ln)
 
             if bt is not None:
-                # new bullet starts
+                # new bullet starts (original behaviour)
                 flush_bullet()
 
                 # Pull the next coordinate-derived level if available; else default to 0
@@ -430,11 +437,19 @@ def convert(pdf_path: str, out_docx_path: str) -> None:
                 continue
 
             if is_head:
+                # heading line (original behaviour)
                 flush_bullet()
                 add_bold_line(doc, ln)
                 continue
 
-            # continuation line: append to existing bullet
+            # ---- NEW FEATURE (opt-in): treat every non-heading line as a bullet ----
+            if force_all_lines_bullets:
+                flush_bullet()
+                current_level = 0
+                current_bullet = ln
+                continue
+
+            # continuation line: append to existing bullet (original behaviour)
             if current_bullet:
                 current_bullet += " " + ln
 
@@ -451,8 +466,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pdf", help="Input slides PDF")
     ap.add_argument("out", help="Output docx")
+    ap.add_argument(
+        "--all-bullets",
+        action="store_true",
+        help="Treat every non-heading line as a bullet (useful for PDFs without bullet glyphs).",
+    )
     args = ap.parse_args()
-    convert(args.pdf, args.out)
+    convert(args.pdf, args.out, force_all_lines_bullets=args.all_bullets)
 
 
 if __name__ == "__main__":
