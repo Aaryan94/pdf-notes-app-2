@@ -13,7 +13,7 @@ st.write("Upload a PDF and download the formatted Word notes.")
 
 pdf_file = st.file_uploader("Upload your PDF", type=["pdf"])
 
-# New: choose conversion mode (default keeps old behaviour)
+# Conversion mode (keeps old behaviour by default)
 mode_label = st.radio(
     "Conversion mode",
     options=[
@@ -43,18 +43,30 @@ if run:
             with open(pdf_path, "wb") as f:
                 f.write(pdf_file.getbuffer())
 
-            # Script 1 (new: pass mode through, default remains bullets_only)
+            # Script 1
             convert(pdf_path, intermediate_docx, mode=mode)
 
-            # Script 2 (unchanged)
+            # Script 2
             apply_template_bullets(intermediate_docx, TEMPLATE_PATH, final_docx)
 
             st.success("Done.")
 
-            with open(final_docx, "rb") as f:
-                st.download_button(
-                    "Download DOCX",
-                    f,
-                    file_name="notes.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
+            col1, col2 = st.columns(2)
+
+            with col1:
+                with open(intermediate_docx, "rb") as f:
+                    st.download_button(
+                        "Download intermediate DOCX",
+                        f,
+                        file_name="notes_intermediate.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+
+            with col2:
+                with open(final_docx, "rb") as f:
+                    st.download_button(
+                        "Download final DOCX",
+                        f,
+                        file_name="notes.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
