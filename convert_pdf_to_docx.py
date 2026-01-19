@@ -458,6 +458,8 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
                 current_level = 0
 
         if mode == "all_lines":
+            # ONLY CHANGE: merge wrapped lines into one bullet when:
+            # same indent level AND next line starts with lowercase.
             coord_lines = _extract_lines_xy_text_excluding_footer(page)
 
             # Remove the title line from the list we bullet (if present)
@@ -469,82 +471,40 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
             coord_lvls = _levels_for_bullets_on_page(coord_xs)
             coord_idx = 0
 
-            # --------- ONLY CHANGE: merge wrapped lines into one bullet (all_lines only) ---------
-            WRAP_Y_GAP = 14.0  # "very close vertically" threshold in PDF points
-
-            def _starts_lowercase(s: str) -> bool:
-                s = s.lstrip()
-                return bool(s) and s[0].islower()
-
-            def _prev_looks_like_continuation(prev: str) -> bool:
-                p = prev.rstrip()
-                if not p:
-                    return False
-                # If it ends with sentence-ending punctuation, usually not a wrap
-                if p.endswith((".", "?", "!", ":", ";")):
-                    return False
-                # If it ends with comma or connective, very likely wrapped
-                if p.endswith(","):
-                    return True
-                low = p.lower()
-                for w in (" and", " or", " but", " because", " so", " then", " which", " that"):
-                    if low.endswith(w):
-                        return True
-                # Otherwise, default to "likely continuation" when no hard stop punctuation
-                return True
-
             merged_text = None
             merged_level = 0
-            merged_y0 = None
 
             def flush_merged():
-                nonlocal merged_text, merged_level, merged_y0
+                nonlocal merged_text, merged_level
                 if merged_text:
                     add_bullet(doc, merged_text.strip(), merged_level)
-                merged_text = None
-                merged_level = 0
-                merged_y0 = None
+                    merged_text = None
+                    merged_level = 0
 
-            for y0, __, txt in coord_lines:
+            for _, __, txt in coord_lines:
                 lvl = coord_lvls[coord_idx] if coord_idx < len(coord_lvls) else 0
                 coord_idx += 1
 
                 bt = bullet_text(txt)
                 text_out = bt if bt is not None else txt
+                text_out_stripped = text_out.strip()
 
-                # (kept exactly as-is from your current file)
-                # Ignore single-character lines (all_lines only)
-                if len(text_out.strip()) == 1:
+                # Keep existing behavior (from your current file): ignore single-character lines
+                if len(text_out_stripped) == 1:
                     continue
 
-                if merged_text is None:
-                    merged_text = text_out
-                    merged_level = lvl
-                    merged_y0 = y0
-                    continue
+                starts_lower = bool(re.match(r"^[a-z]", text_out_stripped))
 
-                same_level = (lvl == merged_level)
-                y_gap = float(y0) - float(merged_y0 if merged_y0 is not None else y0)
-                close_vertically = (y_gap >= 0.0 and y_gap <= WRAP_Y_GAP)
-
-                should_merge = False
-                if same_level and close_vertically:
-                    if _starts_lowercase(text_out) or _prev_looks_like_continuation(merged_text):
-                        should_merge = True
-
-                if should_merge:
-                    merged_text = merged_text.rstrip() + " " + text_out.lstrip()
-                    merged_y0 = y0
+                if merged_text is not None and lvl == merged_level and starts_lower:
+                    merged_text += " " + text_out_stripped
                 else:
                     flush_merged()
-                    merged_text = text_out
+                    merged_text = text_out_stripped
                     merged_level = lvl
-                    merged_y0 = y0
 
             flush_merged()
             doc.add_paragraph("")
             continue
-            # --------- END ONLY CHANGE ---------
 
         # ---- bullets_only (original behaviour) ----
         for ln in lines:
