@@ -44,6 +44,17 @@ def is_footer_noise(line: str) -> bool:
     return False
 
 
+def is_footer_by_position(y0: float, page_height: float) -> bool:
+    """
+    NEW FEATURE:
+    Ignore lines that appear in the bottom ~15% of the page (slide footers like
+    course name + slide number). Position-based => robust, no string matching.
+    """
+    if page_height <= 0:
+        return False
+    return y0 > page_height * 0.85
+
+
 def looks_like_heading(line: str) -> bool:
     l = line.strip()
     if not l:
@@ -160,9 +171,12 @@ def _levels_from_xs(xs: list[float], tol: float = 4.0) -> list[int]:
 def _extract_bullet_x_positions(page: fitz.Page) -> list[float]:
     """
     Original behaviour support: x-positions for lines that start with a bullet glyph.
+    NEW: filters out footer lines by position.
     """
     d = page.get_text("dict")
     hits = []
+
+    page_h = float(page.rect.height) if page.rect else 0.0
 
     for block in d.get("blocks", []):
         if block.get("type") != 0:
@@ -177,15 +191,20 @@ def _extract_bullet_x_positions(page: fitz.Page) -> list[float]:
             if not lt_norm or is_footer_noise(lt_norm):
                 continue
 
+            bbox = line.get("bbox") or spans[0].get("bbox")
+            if not bbox:
+                continue
+
+            y0 = float(bbox[1])
+            if is_footer_by_position(y0, page_h):
+                continue
+
             t = line_text.lstrip()
             if not t or t[0] not in BULLET_CHARS:
                 continue
 
-            bbox = line.get("bbox") or spans[0].get("bbox")
-            if not bbox:
-                continue
-            bullet_x = float(bbox[0])
-            hits.append((float(bbox[1]), float(bbox[0]), bullet_x))
+            x0 = float(bbox[0])
+            hits.append((y0, x0, x0))
 
     hits.sort(key=lambda t: (t[0], t[1]))
     return [bx for _, __, bx in hits]
@@ -193,13 +212,15 @@ def _extract_bullet_x_positions(page: fitz.Page) -> list[float]:
 
 def _extract_all_line_xs_in_reading_order(page: fitz.Page) -> list[tuple[str, float]]:
     """
-    NEW (used only in force_all_lines_bullets mode):
+    Used only in force_all_lines_bullets mode:
     Returns a reading-order list of (normalized_line_text, x0) for ALL text lines.
 
-    We still filter footer noise here, so footer noise never gets assigned a level.
+    NEW: filters out footer lines by position.
     """
     d = page.get_text("dict")
     items: list[tuple[float, float, str, float]] = []
+
+    page_h = float(page.rect.height) if page.rect else 0.0
 
     for block in d.get("blocks", []):
         if block.get("type") != 0:
@@ -219,6 +240,9 @@ def _extract_all_line_xs_in_reading_order(page: fitz.Page) -> list[tuple[str, fl
                 continue
 
             y0 = float(bbox[1])
+            if is_footer_by_position(y0, page_h):
+                continue
+
             x0 = float(bbox[0])
             items.append((y0, x0, txt, x0))
 
@@ -260,11 +284,10 @@ def _align_levels_to_text_lines(text_lines: list[str], dict_lines_with_x: list[t
 
 def _extract_title_from_dict(page: fitz.Page) -> str | None:
     """
-    NEW (used only in force_all_lines_bullets mode):
+    Used only in force_all_lines_bullets mode:
     Find the slide title using font size + top-of-page position.
 
-    We pick the largest-font text line among the top ~25% of the page,
-    excluding footer noise and bullet-start lines.
+    NEW: filters out footer lines by position.
     """
     d = page.get_text("dict")
     candidates: list[tuple[float, float, str]] = []  # (score, y0, text)
@@ -285,14 +308,18 @@ def _extract_title_from_dict(page: fitz.Page) -> str | None:
             if not txt or is_footer_noise(txt):
                 continue
 
-            # Exclude bullet-start lines for title detection
-            if raw_text.lstrip() and raw_text.lstrip()[0] in BULLET_CHARS:
-                continue
-
             bbox = line.get("bbox") or spans[0].get("bbox")
             if not bbox:
                 continue
+
             y0 = float(bbox[1])
+
+            if is_footer_by_position(y0, page_h):
+                continue
+
+            # Exclude bullet-start lines for title detection
+            if raw_text.lstrip() and raw_text.lstrip()[0] in BULLET_CHARS:
+                continue
 
             if y0 > top_cutoff:
                 continue
@@ -454,10 +481,10 @@ def postprocess_formatting(docx_path: str) -> None:
 def convert(pdf_path: str, out_docx_path: str, force_all_lines_bullets: bool = False) -> None:
     """
     IMPORTANT:
-      - When force_all_lines_bullets=False (default), behaviour is identical to your original script.
+      - When force_all_lines_bullets=False (default), behaviour matches your original logic.
       - When force_all_lines_bullets=True:
-          * headings are still detected and emitted the same way
-          * footer noise is still ignored
+          * headings are still detected/emitted the same way
+          * footer noise is ignored (plus NEW: footer-by-position removal)
           * indentation levels still come from coordinate clustering
           * every non-heading line is included as a bullet (even with no bullet glyph)
           * titles are detected using font size + top-of-page position (to avoid missing titles)
@@ -509,7 +536,7 @@ def convert(pdf_path: str, out_docx_path: str, force_all_lines_bullets: bool = F
 
         if not force_all_lines_bullets:
             # -----------------------------
-            # ORIGINAL MODE (UNCHANGED)
+            # ORIGINAL MODE
             # -----------------------------
             bullet_xs = _extract_bullet_x_positions(page)
             bullet_levels = _levels_from_xs(bullet_xs, tol=4.0)
