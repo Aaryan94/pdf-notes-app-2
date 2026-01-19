@@ -213,12 +213,15 @@ def _extract_line_x_positions(page: fitz.Page) -> list[float]:
     return [lx for _, __, lx in hits]
 
 
-def _extract_first_line_text(page: fitz.Page) -> str | None:
+def _extract_lines_xy_text_excluding_footer(page: fitz.Page) -> list[tuple[float, float, str]]:
     """
     ONLY USED FOR all_lines MODE:
-    Determine the slide title as the first text line on the page by (y, x) order,
-    using coordinates (not looks_like_heading), and return its normalized text.
+    Return ALL text lines on the page as (y0, x0, text), sorted by (y0, x0),
+    excluding content in the footer area at the bottom using y-coordinate.
     """
+    FOOTER_CUTOFF_RATIO = 0.90  # bottom 10% treated as footer
+    y_cutoff = float(page.rect.height) * FOOTER_CUTOFF_RATIO
+
     d = page.get_text("dict")
     hits: list[tuple[float, float, str]] = []
 
@@ -230,23 +233,37 @@ def _extract_first_line_text(page: fitz.Page) -> str | None:
             if not spans:
                 continue
 
-            text = "".join(s.get("text", "") for s in spans)
-            text = re.sub(r"\s+", " ", text.strip())
-            if not text or is_footer_noise(text):
-                continue
-
             bbox = line.get("bbox") or spans[0].get("bbox")
             if not bbox:
                 continue
 
             y0 = float(bbox[1])
             x0 = float(bbox[0])
+
+            # Ignore bottom footer region in all-lines mode
+            if y0 >= y_cutoff:
+                continue
+
+            text = "".join(s.get("text", "") for s in spans)
+            text = re.sub(r"\s+", " ", text.strip())
+            if not text or is_footer_noise(text):
+                continue
+
             hits.append((y0, x0, text))
 
+    hits.sort(key=lambda t: (t[0], t[1]))
+    return hits
+
+
+def _extract_first_line_text(page: fitz.Page) -> str | None:
+    """
+    ONLY USED FOR all_lines MODE:
+    Determine the slide title as the first text line on the page by (y, x) order,
+    using coordinates (not looks_like_heading), and return its normalized text.
+    """
+    hits = _extract_lines_xy_text_excluding_footer(page)
     if not hits:
         return None
-
-    hits.sort(key=lambda t: (t[0], t[1]))
     return hits[0][2]
 
 
@@ -412,7 +429,7 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
 
         # Slide title:
         # - bullets_only: original heuristic behaviour (unchanged)
-        # - all_lines: title is first line by (y,x) coordinates
+        # - all_lines: title is first line by (y,x) coordinates (footer excluded by y)
         if mode == "all_lines":
             title = _extract_first_line_text(page)
         else:
@@ -440,6 +457,33 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
                 current_bullet = None
                 current_level = 0
 
+        if mode == "all_lines":
+            # ONLY CHANGE REQUESTED: ignore footer content at bottom of slide (by y coordinate)
+            coord_lines = _extract_lines_xy_text_excluding_footer(page)
+
+            # Remove the title line from the list we bullet (if present)
+            if title:
+                coord_lines = [t for t in coord_lines if t[2] != title]
+
+            # Recompute levels for the remaining lines on this page so indices align
+            coord_xs = [x0 for _, x0, __ in coord_lines]
+            coord_lvls = _levels_for_bullets_on_page(coord_xs)
+            coord_idx = 0
+
+            for _, __, txt in coord_lines:
+                flush_bullet()
+                lvl = coord_lvls[coord_idx] if coord_idx < len(coord_lvls) else 0
+                coord_idx += 1
+
+                bt = bullet_text(txt)
+                text_out = bt if bt is not None else txt
+                add_bullet(doc, text_out, lvl)
+
+            flush_bullet()
+            doc.add_paragraph("")
+            continue
+
+        # ---- bullets_only (original behaviour) ----
         for ln in lines:
             if title and ln == title:
                 continue
@@ -447,16 +491,6 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
             bt = bullet_text(ln)
             is_head = looks_like_heading(ln)
 
-            if mode == "all_lines":
-                # headings in all_lines mode are ONLY the first thing on the slide (already added above)
-                flush_bullet()
-                lvl = line_levels[line_level_idx] if line_level_idx < len(line_levels) else 0
-                line_level_idx += 1
-                text_out = bt if bt is not None else ln
-                add_bullet(doc, text_out, lvl)
-                continue
-
-            # ---- bullets_only (original behaviour) ----
             if bt is not None:
                 flush_bullet()
 
@@ -482,8 +516,7 @@ def convert(pdf_path: str, out_docx_path: str, mode: str = "bullets_only") -> No
 
     doc.save(out_docx_path)
 
-    # ONLY CHANGE REQUESTED:
-    # Run postprocessing for all_lines mode as well (i.e., always run it).
+    # Run postprocessing (as before) for both modes
     postprocess_formatting(out_docx_path)
 
     print(f"Saved (formatted): {out_docx_path}")
