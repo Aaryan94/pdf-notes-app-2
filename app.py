@@ -11,6 +11,13 @@ st.set_page_config(page_title="PDF → Notes", layout="centered")
 st.title("PDF → Notes Generator")
 st.write("Upload a PDF and download the formatted Word notes.")
 
+# Some PDFs (especially handouts) have meaningful lines but no bullet glyphs.
+# When enabled, we treat every non-heading line as if it were a bullet line.
+all_bullets_mode = st.checkbox(
+    "Treat every line as a bullet (for PDFs without bullet points)",
+    value=False,
+)
+
 pdf_file = st.file_uploader("Upload your PDF", type=["pdf"])
 run = st.button("Run", type="primary", disabled=(pdf_file is None))
 
@@ -30,7 +37,7 @@ if run:
                 f.write(pdf_file.getbuffer())
 
             # Script 1
-            convert(pdf_path, intermediate_docx)
+            convert(pdf_path, intermediate_docx, force_all_lines_bullets=all_bullets_mode)
 
             # Script 2
             apply_template_bullets(intermediate_docx, TEMPLATE_PATH, final_docx)
