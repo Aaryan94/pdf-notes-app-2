@@ -21,14 +21,9 @@ mode = st.radio(
         "Handout / no bullets (layout-based)",
     ],
     index=0,
-    help=(
-        "Choose 'Handout / no bullets' for PDFs that are mostly continuous text with headings, "
-        "tables, or paragraphs (few/no bullet glyphs)."
-    ),
 )
 
 no_bullets = mode.startswith("Handout")
-
 run = st.button("Run", type="primary", disabled=(pdf_file is None))
 
 if run:
@@ -46,41 +41,32 @@ if run:
             with open(pdf_path, "wb") as f:
                 f.write(pdf_file.getbuffer())
 
-            # ---- Script 1 (convert) ----
-            # Backwards-compatible: only pass the flag if convert() supports it.
-            try:
-                sig = inspect.signature(convert)
-                params = sig.parameters
+            # Script 1 (convert) — only pass flag if supported
+            sig = inspect.signature(convert)
+            params = sig.parameters
+            if "no_bullets" in params:
+                convert(pdf_path, intermediate_docx, no_bullets=no_bullets)
+            elif "mode" in params:
+                convert(pdf_path, intermediate_docx, mode=("handout" if no_bullets else "bullets"))
+            else:
+                if no_bullets:
+                    st.warning(
+                        "You selected 'Handout / no bullets', but convert() does not support that flag yet. "
+                        "Running bullet mode."
+                    )
+                convert(pdf_path, intermediate_docx)
 
-                if "no_bullets" in params:
-                    convert(pdf_path, intermediate_docx, no_bullets=no_bullets)
-                elif "mode" in params:
-                    convert(pdf_path, intermediate_docx, mode=("handout" if no_bullets else "bullets"))
-                else:
-                    # convert() doesn't accept a mode flag yet
-                    if no_bullets:
-                        st.warning(
-                            "You selected 'Handout / no bullets', but convert() does not yet support a mode flag. "
-                            "It will run in bullet mode for now."
-                        )
-                    convert(pdf_path, intermediate_docx)
+            # Script 2
+            apply_template_bullets(intermediate_docx, TEMPLATE_PATH, final_docx)
 
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
-                st.stop()
-
-            # ---- Script 2 (template bullets) ----
-            try:
-                apply_template_bullets(intermediate_docx, TEMPLATE_PATH, final_docx)
-            except Exception as e:
-                st.error(f"Template formatting failed: {e}")
-                st.stop()
+            # IMPORTANT: read bytes BEFORE temp dir is deleted
+            with open(final_docx, "rb") as f:
+                final_bytes = f.read()
 
     st.success("Done.")
-    with open(final_docx, "rb") as f:
-        st.download_button(
-            "Download DOCX",
-            f,
-            file_name="notes.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
+    st.download_button(
+        "Download DOCX",
+        data=final_bytes,
+        file_name="notes.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
