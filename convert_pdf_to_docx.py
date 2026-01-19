@@ -177,7 +177,6 @@ def _extract_bullet_x_positions(page: fitz.Page) -> list[float]:
             if not lt_norm or is_footer_noise(lt_norm):
                 continue
 
-            # detect bullet at first non-space char of line_text
             t = line_text.lstrip()
             if not t or t[0] not in BULLET_CHARS:
                 continue
@@ -223,7 +222,6 @@ def _extract_all_line_xs_in_reading_order(page: fitz.Page) -> list[tuple[str, fl
             x0 = float(bbox[0])
             items.append((y0, x0, txt, x0))
 
-    # reading order
     items.sort(key=lambda t: (t[0], t[1]))
     return [(txt, x0) for _, __, txt, x0 in items]
 
@@ -239,7 +237,6 @@ def _align_levels_to_text_lines(text_lines: list[str], dict_lines_with_x: list[t
     dict_xs = [x for _, x in dict_lines_with_x]
     dict_levels = _levels_from_xs(dict_xs, tol=4.0) if dict_xs else []
 
-    # Build a mapping from normalized text to a queue of indices in dict order
     positions: dict[str, list[int]] = {}
     for i, t in enumerate(dict_texts):
         positions.setdefault(t, []).append(i)
@@ -261,8 +258,65 @@ def _align_levels_to_text_lines(text_lines: list[str], dict_lines_with_x: list[t
     return aligned
 
 
+def _extract_title_from_dict(page: fitz.Page) -> str | None:
+    """
+    NEW (used only in force_all_lines_bullets mode):
+    Find the slide title using font size + top-of-page position.
+
+    We pick the largest-font text line among the top ~25% of the page,
+    excluding footer noise and bullet-start lines.
+    """
+    d = page.get_text("dict")
+    candidates: list[tuple[float, float, str]] = []  # (score, y0, text)
+
+    page_h = float(page.rect.height) if page.rect else 0.0
+    top_cutoff = page_h * 0.25 if page_h > 0 else float("inf")
+
+    for block in d.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+
+            raw_text = "".join(s.get("text", "") for s in spans)
+            txt = _normalize_line_text_for_match(raw_text)
+            if not txt or is_footer_noise(txt):
+                continue
+
+            # Exclude bullet-start lines for title detection
+            if raw_text.lstrip() and raw_text.lstrip()[0] in BULLET_CHARS:
+                continue
+
+            bbox = line.get("bbox") or spans[0].get("bbox")
+            if not bbox:
+                continue
+            y0 = float(bbox[1])
+
+            if y0 > top_cutoff:
+                continue
+
+            max_size = 0.0
+            for s in spans:
+                sz = s.get("size")
+                if isinstance(sz, (int, float)):
+                    max_size = max(max_size, float(sz))
+
+            score = max_size * 1000.0 - y0
+            candidates.append((score, y0, txt))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][2]
+
+
 # ----------------------------
-# POSTPROCESSING ONLY (unchanged)
+# POSTPROCESSING ONLY: make bullets look like Word default (filled dot at all levels)
+# and make headings bulleted + indent their children appropriately.
+# (NO content changes.)
 # ----------------------------
 def postprocess_formatting(docx_path: str) -> None:
     """
@@ -279,8 +333,10 @@ def postprocess_formatting(docx_path: str) -> None:
         txt = (p.text or "").strip()
         if not txt:
             return False
+        # don't treat list paragraphs as headings
         if p.style and p.style.name and p.style.name.startswith("List"):
             return False
+        # Heading = all non-empty runs are bold
         any_nonempty_run = False
         for run in p.runs:
             if run.text and run.text.strip():
@@ -293,6 +349,8 @@ def postprocess_formatting(docx_path: str) -> None:
         return bool(p.style and p.style.name and p.style.name.startswith("List"))
 
     def bullet_level_from_style_name(name: str) -> int:
+        # Infer level from what the converter produced:
+        # "List Bullet" => 0, "List Bullet 2" => 1, "List Bullet 3" => 2
         if name == "List Bullet":
             return 0
         if name == "List Bullet 2":
@@ -301,9 +359,11 @@ def postprocess_formatting(docx_path: str) -> None:
             return 2
         return 0
 
-    HANG = Pt(18)
-    STEP = Pt(18)
-    BASE_LEFT = Pt(18)
+    # Indentation parameters (points). Adjust if you want slightly different spacing,
+    # but this keeps a clean Word-like nested bullet appearance.
+    HANG = Pt(18)       # hanging indent so wrapped lines align after bullet glyph
+    STEP = Pt(18)       # indent step per level
+    BASE_LEFT = Pt(18)  # level 0 left indent
 
     def apply_level_indent(p, level: int) -> None:
         level = max(0, min(level, 2))
@@ -316,11 +376,12 @@ def postprocess_formatting(docx_path: str) -> None:
             r.font.name = "Aptos (Body)"
             r.font.size = Pt(12)
 
-    # (1) Remove headings with no bullets beneath them
+    # ---- (1) Remove headings that have no bullets beneath them ----
     to_delete_idxs = []
     for i, p in enumerate(paras):
         if not is_heading(p):
             continue
+
         has_bullet = False
         for j in range(i + 1, len(paras)):
             nxt = paras[j]
@@ -329,6 +390,7 @@ def postprocess_formatting(docx_path: str) -> None:
             if is_bullet(nxt):
                 has_bullet = True
                 break
+
         if not has_bullet:
             to_delete_idxs.append(i)
 
@@ -336,22 +398,29 @@ def postprocess_formatting(docx_path: str) -> None:
         p = paras[i]
         p._element.getparent().remove(p._element)
 
+    # Refresh after deletions
     paras = doc.paragraphs
 
-    # (2)(3) enforce filled-dot bullet style + indent nesting
+    # ---- (2)(3) Headings => List Bullet; bullets => List Bullet always, indent for nesting ----
     in_heading_block = False
+
     for p in paras:
         if is_heading(p):
+            # Heading becomes a filled-dot bullet at level 0
             p.style = doc.styles["List Bullet"]
             apply_level_indent(p, 0)
+
+            # Keep heading bold (already bold, but enforce)
             for r in p.runs:
                 if r.text and r.text.strip():
                     r.bold = True
             enforce_aptos_12(p)
+
             in_heading_block = True
             continue
 
         if in_heading_block and is_bullet(p):
+            # Shift bullets under heading +1 level, but keep filled-dot bullet glyph
             old_name = p.style.name if p.style else ""
             old_level = bullet_level_from_style_name(old_name)
             new_level = min(old_level + 1, 2)
@@ -361,12 +430,14 @@ def postprocess_formatting(docx_path: str) -> None:
             enforce_aptos_12(p)
             continue
 
+        # End heading block when we hit blank or non-bullet content
         if (p.text or "").strip() == "":
             in_heading_block = False
         else:
             if not is_bullet(p):
                 in_heading_block = False
 
+        # For bullets not under headings, still force filled-dot look and preserve their level
         if is_bullet(p):
             old_name = p.style.name if p.style else ""
             lvl = bullet_level_from_style_name(old_name)
@@ -384,11 +455,12 @@ def convert(pdf_path: str, out_docx_path: str, force_all_lines_bullets: bool = F
     """
     IMPORTANT:
       - When force_all_lines_bullets=False (default), behaviour is identical to your original script.
-      - When force_all_lines_bullets=True, we still:
-          * detect headings the same way as before
-          * ignore footer noise the same way as before
-          * use coordinate-based clustering for indentation levels
-        but we treat every non-heading line as a bullet (even if it has no bullet glyph).
+      - When force_all_lines_bullets=True:
+          * headings are still detected and emitted the same way
+          * footer noise is still ignored
+          * indentation levels still come from coordinate clustering
+          * every non-heading line is included as a bullet (even with no bullet glyph)
+          * titles are detected using font size + top-of-page position (to avoid missing titles)
     """
     pdf = fitz.open(pdf_path)
     doc = Document()
@@ -403,14 +475,20 @@ def convert(pdf_path: str, out_docx_path: str, force_all_lines_bullets: bool = F
         if not lines:
             continue
 
-        # Slide title: first non-bullet line (or short fallback)
-        title = None
-        for ln in lines:
-            if bullet_text(ln) is not None:
-                continue
-            if looks_like_heading(ln) or len(ln) <= 60:
-                title = ln
-                break
+        # -----------------------------
+        # Title detection
+        # -----------------------------
+        if force_all_lines_bullets:
+            title = _extract_title_from_dict(page)
+        else:
+            # ORIGINAL: keep existing behaviour unchanged
+            title = None
+            for ln in lines:
+                if bullet_text(ln) is not None:
+                    continue
+                if looks_like_heading(ln) or len(ln) <= 60:
+                    title = ln
+                    break
 
         # Skip slides titled Outline or Summary (case-insensitive)
         if title and title.strip().lower() in {"outline", "summary"}:
@@ -445,8 +523,10 @@ def convert(pdf_path: str, out_docx_path: str, force_all_lines_bullets: bool = F
                 is_head = looks_like_heading(ln)
 
                 if bt is not None:
+                    # new bullet starts
                     flush_bullet()
 
+                    # Pull the next coordinate-derived level if available; else default to 0
                     if bullet_level_idx < len(bullet_levels):
                         current_level = bullet_levels[bullet_level_idx]
                         bullet_level_idx += 1
@@ -513,7 +593,7 @@ def main():
     ap.add_argument(
         "--all-bullets",
         action="store_true",
-        help="Treat every non-heading line as a bullet, still using coordinate-based indentation.",
+        help="Treat every non-heading line as a bullet, still using coordinate-based indentation + dict-based titles.",
     )
     args = ap.parse_args()
     convert(args.pdf, args.out, force_all_lines_bullets=args.all_bullets)
