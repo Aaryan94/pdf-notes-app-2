@@ -1,7 +1,5 @@
 import re
 import argparse
-from dataclasses import dataclass
-from collections import Counter, defaultdict
 
 import fitz  # PyMuPDF
 from docx import Document
@@ -9,22 +7,7 @@ from docx.shared import Pt
 from docx.oxml.ns import qn
 
 
-# ============================================================
-# IMPORTANT NOTE
-# ============================================================
-# Bullet mode functionality is preserved as-is.
-# The existing bullet-mode pipeline (text extraction, coordinate-based
-# bullet indent inference, and postprocess_formatting) is kept unchanged.
-#
-# We add a new optional flag `no_bullets` to `convert(...)` that switches
-# to a separate "handout/no bullets" pipeline based on coordinates for
-# *all* lines, WITHOUT using bold for classification.
-# ============================================================
-
-
-# ----------------------------
-# BULLET DETECTION (PDF TEXT)  (UNCHANGED)
-# ----------------------------
+# Common bullet markers that appear in extracted PDF text
 BULLET_CHARS = [
     "➣", "➤", "➢", "➔",
     "•", "◦", "·", "∙", "‣", "⁃",
@@ -32,6 +15,7 @@ BULLET_CHARS = [
     "-", "–", "—",
 ]
 
+# Regex: optional leading spaces, then one of the bullet chars, then the bullet text
 BULLET_RE = re.compile(rf"^\s*(?:{'|'.join(re.escape(c) for c in BULLET_CHARS)})\s+(.*\S)\s*$")
 
 
@@ -48,7 +32,6 @@ def set_aptos_12(doc: Document) -> None:
 
 
 def is_footer_noise(line: str) -> bool:
-    # (UNCHANGED)
     l = line.strip()
     if not l:
         return True
@@ -62,7 +45,6 @@ def is_footer_noise(line: str) -> bool:
 
 
 def looks_like_heading(line: str) -> bool:
-    # (UNCHANGED)
     l = line.strip()
     if not l:
         return False
@@ -112,12 +94,12 @@ def add_bullet(doc: Document, text: str, level: int = 0) -> None:
         r.font.size = Pt(12)
 
 
-def normalize_lines(text: str):
-    # (UNCHANGED)
+# ✅ UPDATE ONLY: add skip_noise flag so we can stop skipping lines in no_bullets mode
+def normalize_lines(text: str, skip_noise: bool = True):
     lines = []
     for ln in text.splitlines():
         ln = re.sub(r"\s+", " ", ln.strip())
-        if ln and not is_footer_noise(ln):
+        if ln and (not skip_noise or not is_footer_noise(ln)):
             lines.append(ln)
     return lines
 
@@ -133,7 +115,7 @@ def bullet_text(line: str):
 
 
 # ----------------------------
-# COORDINATE-BASED BULLET LEVELS  (UNCHANGED)
+# COORDINATE-BASED BULLET LEVELS
 # ----------------------------
 def _is_bullet_start_text(t: str) -> bool:
     if not t:
@@ -244,7 +226,9 @@ def _levels_for_bullets_on_page(bullet_xs: list[float]) -> list[int]:
 
 
 # ----------------------------
-# POSTPROCESSING ONLY (UNCHANGED)
+# POSTPROCESSING ONLY: make bullets look like Word default (filled dot at all levels)
+# and make headings bulleted + indent their children appropriately.
+# (NO content changes.)
 # ----------------------------
 def postprocess_formatting(docx_path: str) -> None:
     """
@@ -254,6 +238,7 @@ def postprocess_formatting(docx_path: str) -> None:
     3) Force ALL bullets to use "List Bullet" (filled dot) and simulate nesting via indentation only.
        Bullets under a heading are shifted +1 level deeper (cap at 2).
     """
+
     doc = Document(docx_path)
     paras = doc.paragraphs
 
@@ -277,6 +262,8 @@ def postprocess_formatting(docx_path: str) -> None:
         return bool(p.style and p.style.name and p.style.name.startswith("List"))
 
     def bullet_level_from_style_name(name: str) -> int:
+        # Infer level from what the converter produced:
+        # "List Bullet" => 0, "List Bullet 2" => 1, "List Bullet 3" => 2
         if name == "List Bullet":
             return 0
         if name == "List Bullet 2":
@@ -285,9 +272,11 @@ def postprocess_formatting(docx_path: str) -> None:
             return 2
         return 0
 
-    HANG = Pt(18)
-    STEP = Pt(18)
-    BASE_LEFT = Pt(18)
+    # Indentation parameters (points). Adjust if you want slightly different spacing,
+    # but this keeps a clean Word-like nested bullet appearance.
+    HANG = Pt(18)       # hanging indent so wrapped lines align after bullet glyph
+    STEP = Pt(18)       # indent step per level
+    BASE_LEFT = Pt(18)  # level 0 left indent
 
     def apply_level_indent(p, level: int) -> None:
         level = max(0, min(level, 2))
@@ -300,7 +289,7 @@ def postprocess_formatting(docx_path: str) -> None:
             r.font.name = "Aptos (Body)"
             r.font.size = Pt(12)
 
-    # (1) Remove headings with no bullets beneath them
+    # ---- (1) Remove headings that have no bullets beneath them (same as your original cleanup) ----
     to_delete_idxs = []
     for i, p in enumerate(paras):
         if not is_heading(p):
@@ -322,16 +311,19 @@ def postprocess_formatting(docx_path: str) -> None:
         p = paras[i]
         p._element.getparent().remove(p._element)
 
+    # Refresh after deletions
     paras = doc.paragraphs
 
-    # (2)(3) Headings => List Bullet; bullets => List Bullet always, indent for nesting
+    # ---- (2)(3) Headings => List Bullet; bullets => List Bullet always, indent for nesting ----
     in_heading_block = False
 
     for p in paras:
         if is_heading(p):
+            # Heading becomes a filled-dot bullet at level 0
             p.style = doc.styles["List Bullet"]
             apply_level_indent(p, 0)
 
+            # Keep heading bold (already bold, but enforce)
             for r in p.runs:
                 if r.text and r.text.strip():
                     r.bold = True
@@ -341,6 +333,7 @@ def postprocess_formatting(docx_path: str) -> None:
             continue
 
         if in_heading_block and is_bullet(p):
+            # Shift bullets under heading +1 level, but keep filled-dot bullet glyph
             old_name = p.style.name if p.style else ""
             old_level = bullet_level_from_style_name(old_name)
             new_level = min(old_level + 1, 2)
@@ -350,12 +343,14 @@ def postprocess_formatting(docx_path: str) -> None:
             enforce_aptos_12(p)
             continue
 
+        # End heading block when we hit blank or non-bullet content
         if (p.text or "").strip() == "":
             in_heading_block = False
         else:
             if not is_bullet(p):
                 in_heading_block = False
 
+        # For bullets not under headings, still force filled-dot look and preserve their level
         if is_bullet(p):
             old_name = p.style.name if p.style else ""
             lvl = bullet_level_from_style_name(old_name)
@@ -369,369 +364,9 @@ def postprocess_formatting(docx_path: str) -> None:
     doc.save(docx_path)
 
 
-# ============================================================
-# HANDOUT / NO-BULLETS MODE (NEW)
-# ============================================================
-
-@dataclass(frozen=True)
-class LineObj:
-    page_index: int
-    text: str
-    x0: float
-    y0: float
-    y1: float
-    font_size: float
-    span_count: int
-
-
-def _norm_text_for_repeat(s: str) -> str:
-    s = re.sub(r"\s+", " ", (s or "").strip())
-    # Normalize common page counters like "3 / 18" or "3/18"
-    s = re.sub(r"\b\d+\s*/\s*\d+\b", "{PAGECOUNT}", s)
-    # Normalize standalone numbers
-    s = re.sub(r"\b\d+\b", "{N}", s)
-    return s.lower()
-
-
-def _extract_all_lines_with_coords(pdf: fitz.Document) -> list[LineObj]:
-    out: list[LineObj] = []
-    for pi in range(pdf.page_count):
-        page = pdf.load_page(pi)
-        d = page.get_text("dict")
-        for block in d.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            for line in block.get("lines", []):
-                spans = line.get("spans", []) or []
-                if not spans:
-                    continue
-                text = "".join(s.get("text", "") for s in spans)
-                text = re.sub(r"\s+", " ", (text or "").strip())
-                if not text:
-                    continue
-
-                # Coordinates
-                bbox = line.get("bbox") or spans[0].get("bbox")
-                if not bbox:
-                    continue
-                x0 = float(bbox[0])
-                y0 = float(bbox[1])
-                y1 = float(bbox[3])
-
-                # Font size: robust median-ish via average
-                sizes = [float(s.get("size", 0.0)) for s in spans if s.get("size") is not None]
-                fs = (sum(sizes) / len(sizes)) if sizes else 0.0
-
-                out.append(
-                    LineObj(
-                        page_index=pi,
-                        text=text,
-                        x0=x0,
-                        y0=y0,
-                        y1=y1,
-                        font_size=fs,
-                        span_count=len(spans),
-                    )
-                )
-
-    # Sort global reading order: page, then y, then x
-    out.sort(key=lambda l: (l.page_index, l.y0, l.x0))
-    return out
-
-
-def _detect_repeating_header_footer_lines(
-    pdf: fitz.Document,
-    all_lines: list[LineObj],
-    top_frac: float = 0.10,
-    bot_frac: float = 0.12,
-    repeat_threshold: float = 0.55,
-) -> set[tuple[int, str]]:
-    """
-    Identify (page_index, normalized_text) pairs to drop, based on repetition across pages
-    and being located in the top/bottom bands of the page.
-
-    We intentionally do NOT use bold. This is purely coordinate + repetition.
-    """
-    # Bucket lines by page
-    lines_by_page: dict[int, list[LineObj]] = defaultdict(list)
-    for l in all_lines:
-        lines_by_page[l.page_index].append(l)
-
-    total_pages = max(1, pdf.page_count)
-    norm_counts = Counter()
-
-    candidates: list[tuple[int, str]] = []
-
-    for pi in range(pdf.page_count):
-        page = pdf.load_page(pi)
-        height = float(page.rect.height) if page.rect else 1.0
-        top_y = height * top_frac
-        bot_y = height * (1.0 - bot_frac)
-
-        for l in lines_by_page.get(pi, []):
-            band = "mid"
-            if l.y0 <= top_y:
-                band = "top"
-            elif l.y1 >= bot_y:
-                band = "bot"
-            else:
-                continue
-
-            nt = _norm_text_for_repeat(l.text)
-            if not nt or len(nt) <= 2:
-                continue
-
-            norm_counts[nt] += 1
-            candidates.append((pi, nt))
-
-    # Which normalized strings repeat on enough pages?
-    min_pages = max(2, int(total_pages * repeat_threshold))
-    repeating_norms = {nt for nt, c in norm_counts.items() if c >= min_pages}
-
-    to_drop = {(pi, nt) for (pi, nt) in candidates if nt in repeating_norms}
-    return to_drop
-
-
-def _cluster_centers(xs: list[float], tol: float = 6.0) -> list[float]:
-    # Similar to bullet clustering but with a slightly wider tolerance for handout layout.
-    if not xs:
-        return []
-    xs_sorted = sorted(xs)
-    clusters = [[xs_sorted[0]]]
-    for x in xs_sorted[1:]:
-        if abs(x - clusters[-1][-1]) <= tol:
-            clusters[-1].append(x)
-        else:
-            clusters.append([x])
-    centers = [sum(c) / len(c) for c in clusters]
-    centers.sort()
-    return centers
-
-
-def _assign_indent_level(x0: float, centers: list[float], max_level: int = 2) -> int:
-    if not centers:
-        return 0
-    idx = min(range(len(centers)), key=lambda i: abs(x0 - centers[i]))
-    return max(0, min(idx, max_level))
-
-
-def _is_tableish(line: LineObj) -> bool:
-    """
-    Heuristic: table-ish lines often have multiple spans and short token clusters.
-    We avoid overfitting; this only gates "don't force bullets".
-    """
-    if line.span_count >= 4:
-        return True
-    # Many column-like separators / repeated spacing patterns in text
-    if re.search(r"\s{2,}", line.text):
-        return True
-    # Truth-table-ish: lots of single-char tokens
-    tokens = re.findall(r"\S+", line.text)
-    if len(tokens) >= 6 and sum(1 for t in tokens if len(t) == 1) / len(tokens) >= 0.6:
-        return True
-    return False
-
-
-def _handout_detect_headings(
-    page_lines: list[LineObj],
-    centers: list[float],
-) -> set[int]:
-    """
-    Return indices (into page_lines) that are headings.
-    We do NOT use bold. We use font size + spacing + position.
-    """
-    if not page_lines:
-        return set()
-
-    # Body font size: median-ish via simple robust percentile
-    sizes = sorted([l.font_size for l in page_lines if l.font_size > 0.0])
-    if not sizes:
-        return set()
-    body = sizes[len(sizes) // 2]
-
-    # A heading is typically noticeably larger than body.
-    # Use a small additive margin to handle small fonts.
-    size_thresh = max(body + 1.0, body * 1.12)
-
-    heading_idxs: set[int] = set()
-
-    # Compute y-gaps
-    for i, l in enumerate(page_lines):
-        # Font size signal
-        if l.font_size < size_thresh:
-            continue
-
-        # Position signal: closer to left margin band
-        lvl = _assign_indent_level(l.x0, centers, max_level=2)
-        if lvl > 0:
-            # headings usually start near left edge; allow but require stronger spacing
-            pass
-
-        # Spacing signal: big gap above or below
-        gap_above = None
-        gap_below = None
-        if i > 0:
-            gap_above = l.y0 - page_lines[i - 1].y1
-        if i + 1 < len(page_lines):
-            gap_below = page_lines[i + 1].y0 - l.y1
-
-        # Typical line height ~ (y1-y0)
-        lh = max(1.0, (l.y1 - l.y0))
-        big_gap = ((gap_above is not None and gap_above >= 0.8 * lh) or
-                   (gap_below is not None and gap_below >= 0.8 * lh))
-
-        # Text-shape helper (not required, but stabilizes):
-        shortish = len(l.text) <= 90
-        colonish = l.text.endswith(":")
-        upperish = l.text.isupper() and len(l.text) <= 80
-
-        if big_gap or colonish or upperish or shortish:
-            heading_idxs.add(i)
-
-    # De-duplicate consecutive headings (keep the first if they are effectively the same region)
-    cleaned: set[int] = set()
-    last_y1 = None
-    for i in sorted(heading_idxs):
-        l = page_lines[i]
-        if last_y1 is not None and l.y0 - last_y1 < 3.0:
-            # Very close; likely part of the same heading block; keep earliest only
-            continue
-        cleaned.add(i)
-        last_y1 = l.y1
-
-    return cleaned
-
-
-def _handout_convert(pdf: fitz.Document, out_docx_path: str) -> None:
-    doc = Document()
-    set_aptos_12(doc)
-
-    all_lines = _extract_all_lines_with_coords(pdf)
-
-    # Identify repeating header/footer lines to drop
-    to_drop = _detect_repeating_header_footer_lines(pdf, all_lines)
-
-    # Group lines by page (post drop)
-    by_page: dict[int, list[LineObj]] = defaultdict(list)
-    for l in all_lines:
-        nt = _norm_text_for_repeat(l.text)
-        if (l.page_index, nt) in to_drop:
-            continue
-        # Basic whitespace cleanup (do not collapse internal symbols)
-        txt = re.sub(r"\s+", " ", (l.text or "").strip())
-        if not txt:
-            continue
-        by_page[l.page_index].append(
-            LineObj(
-                page_index=l.page_index,
-                text=txt,
-                x0=l.x0,
-                y0=l.y0,
-                y1=l.y1,
-                font_size=l.font_size,
-                span_count=l.span_count,
-            )
-        )
-
-    for pi in range(pdf.page_count):
-        page_lines = by_page.get(pi, [])
-        if not page_lines:
-            continue
-
-        # Build indent bands (x0 clusters) using *all* non-empty lines
-        xs = [l.x0 for l in page_lines]
-        centers = _cluster_centers(xs, tol=6.0)
-
-        # Detect headings without bold
-        heading_idxs = _handout_detect_headings(page_lines, centers)
-
-        # If the first line looks like a title and is a heading, keep it (like bullet mode keeps titles)
-        # We will emit headings as bold lines in the DOCX (same heading representation as bullet mode output).
-        current_heading_active = False
-
-        # Group lines into blocks using y-gaps + indent level
-        i = 0
-        while i < len(page_lines):
-            l = page_lines[i]
-
-            if i in heading_idxs:
-                # Emit heading as-is (like bullet mode "title/heading line")
-                add_bold_line(doc, l.text)
-                current_heading_active = True
-                i += 1
-                continue
-
-            # Table-ish region: emit as plain paragraphs (do not force bullets)
-            if _is_tableish(l):
-                # Group consecutive table-ish lines with small gaps
-                j = i + 1
-                while j < len(page_lines):
-                    nxt = page_lines[j]
-                    if j in heading_idxs:
-                        break
-                    if not _is_tableish(nxt):
-                        break
-                    gap = nxt.y0 - page_lines[j - 1].y1
-                    if gap > 10.0:
-                        break
-                    j += 1
-
-                for k in range(i, j):
-                    p = doc.add_paragraph(page_lines[k].text)
-                    for r in p.runs:
-                        r.font.name = "Aptos (Body)"
-                        r.font.size = Pt(12)
-                i = j
-                continue
-
-            # Otherwise: treat as a "list/paragraph-like" block.
-            # To keep output consistent with your notes style, we render these as bullets.
-            # Nesting comes from indent band levels.
-            level = _assign_indent_level(l.x0, centers, max_level=2)
-
-            # Build a block by collecting continuation lines that are visually part of this item:
-            # same indent band (or very close), and small vertical gaps.
-            item_text = l.text
-            j = i + 1
-            while j < len(page_lines):
-                nxt = page_lines[j]
-                if j in heading_idxs:
-                    break
-                if _is_tableish(nxt):
-                    break
-
-                nxt_level = _assign_indent_level(nxt.x0, centers, max_level=2)
-
-                gap = nxt.y0 - page_lines[j - 1].y1
-
-                # Continuation rule: same level and small gap -> append
-                if nxt_level == level and gap <= 6.0:
-                    item_text += " " + nxt.text
-                    j += 1
-                    continue
-
-                # If next line is deeper indent and very close, treat it as a new bullet,
-                # not continuation.
-                break
-
-            # Emit as bullet (even at level 0), because in no-bullets mode you still want
-            # "notes style" output. Headings remain included above, as in bullet mode.
-            add_bullet(doc, item_text.strip(), level)
-
-            i = j
-
-        # Page separator like bullet mode
-        doc.add_paragraph("")
-
-    doc.save(out_docx_path)
-    print(f"Saved (handout mode): {out_docx_path}")
-
-
-# ============================================================
-# BULLET MODE CONVERTER (EXISTING) — UNCHANGED LOGIC
-# ============================================================
-
-def _bullet_convert(pdf: fitz.Document, out_docx_path: str) -> None:
+# ✅ UPDATE ONLY: add no_bullets flag so app.py can pass it, and use it to control skipping
+def convert(pdf_path: str, out_docx_path: str, no_bullets: bool = False) -> None:
+    pdf = fitz.open(pdf_path)
     doc = Document()
     set_aptos_12(doc)
 
@@ -740,7 +375,10 @@ def _bullet_convert(pdf: fitz.Document, out_docx_path: str) -> None:
 
         # IMPORTANT: keep your existing text extraction so output content stays identical
         raw = page.get_text("text") or ""
-        lines = normalize_lines(raw)
+
+        # ✅ UPDATE ONLY: if no_bullets=True, do NOT skip "footer noise" lines
+        lines = normalize_lines(raw, skip_noise=not no_bullets)
+
         if not lines:
             continue
 
@@ -814,36 +452,12 @@ def _bullet_convert(pdf: fitz.Document, out_docx_path: str) -> None:
     print(f"Saved (formatted): {out_docx_path}")
 
 
-# ============================================================
-# PUBLIC API
-# ============================================================
-
-def convert(pdf_path: str, out_docx_path: str, no_bullets: bool = False) -> None:
-    """
-    Convert a PDF into a DOCX notes format.
-
-    - no_bullets=False (default): ORIGINAL bullet-mode behavior (unchanged).
-    - no_bullets=True: Handout/no-bullets mode using coordinates on all lines
-      (no bold classification; headings kept and emitted like bullet mode).
-    """
-    pdf = fitz.open(pdf_path)
-    if no_bullets:
-        _handout_convert(pdf, out_docx_path)
-    else:
-        _bullet_convert(pdf, out_docx_path)
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("pdf", help="Input PDF")
+    ap.add_argument("pdf", help="Input slides PDF")
     ap.add_argument("out", help="Output docx")
-    ap.add_argument(
-        "--no-bullets",
-        action="store_true",
-        help="Handout/no-bullets mode: infer structure from coordinates on all lines",
-    )
     args = ap.parse_args()
-    convert(args.pdf, args.out, no_bullets=args.no_bullets)
+    convert(args.pdf, args.out)
 
 
 if __name__ == "__main__":
