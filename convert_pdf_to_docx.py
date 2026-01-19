@@ -450,7 +450,11 @@ def convert(pdf_path: str, out_docx_path: str, no_bullets: bool = False) -> None
 
     # Save then postprocess formatting (ONLY formatting changes)
     doc.save(out_docx_path)
-    postprocess_formatting(out_docx_path)
+
+    # FIX: in handout/no_bullets mode, don't run heading-deletion cleanup (it can delete everything)
+    if not no_bullets:
+        postprocess_formatting(out_docx_path)
+
     print(f"Saved (formatted): {out_docx_path}")
 
 
