@@ -54,7 +54,7 @@ st.set_page_config(page_title="PDF → Notes", layout="centered")
 # Header
 # ----------------------------
 st.title("PDF → Notes Generator 2")
-st.caption("Upload a lecture slides PDF and get cleanly formatted Word notes./nUpdated to work better with slides that don't have clear bullets.")
+st.caption("Upload a lecture slides PDF and get cleanly formatted Word notes.\n\nUpdated to work better with slides that don't have clear bullets.")
 
 # ----------------------------
 # Help / Docs
